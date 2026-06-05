@@ -1,0 +1,109 @@
+groups:
+  - name: vision_moderation_slo_alerts
+    interval: 30s
+    rules:
+      # Multi-window burn-rate alerts for availability SLO (99.5%)
+      # Monthly error budget: 0.5% = 21.6 minutes
+      # Fast burn: 2% of budget consumed in 1 hour = 0.432 minutes = 25.92 requests/hour (at scale)
+      # Slow burn: 10% of budget consumed in 24 hours = 2.16 minutes
+      
+      - alert: AvailabilityBurnFast
+        expr: |
+          (
+            sum(rate(http_requests_total{job="vision-moderation",code=~"5.."}[1h]))
+            /
+            sum(rate(http_requests_total{job="vision-moderation"}[1h]))
+          ) > (14.4 * (1 - 0.995))
+        for: 5m
+        labels:
+          severity: page
+          slo: availability
+          component: vision-moderation
+        annotations:
+          summary: "Availability burn rate is consuming error budget too fast"
+          description: |
+            The error rate over the last 1 hour is {{ $value | humanizePercentage }}.
+            At this rate, 2% of the monthly error budget will be consumed in 1 hour.
+            This requires immediate attention.
+          runbook: "https://runbooks.example.com/vision-moderation/availability-burn-fast"
+
+      - alert: AvailabilityBurnSlow
+        expr: |
+          (
+            sum(rate(http_requests_total{job="vision-moderation",code=~"5.."}[24h]))
+            /
+            sum(rate(http_requests_total{job="vision-moderation"}[24h]))
+          ) > (1.44 * (1 - 0.995))
+        for: 15m
+        labels:
+          severity: ticket
+          slo: availability
+          component: vision-moderation
+        annotations:
+          summary: "Availability burn rate is elevated over 24 hours"
+          description: |
+            The error rate over the last 24 hours is {{ $value | humanizePercentage }}.
+            At this rate, 10% of the monthly error budget will be consumed.
+            This warrants investigation and may require remediation.
+          runbook: "https://runbooks.example.com/vision-moderation/availability-burn-slow"
+
+      # Latency alert for p99
+      - alert: LatencyP99High
+        expr: |
+          histogram_quantile(0.99,
+            sum(rate(http_request_duration_seconds_bucket{job="vision-moderation"}[5m])) by (le)
+          ) > 1.0
+        for: 5m
+        labels:
+          severity: page
+          slo: latency
+          component: vision-moderation
+        annotations:
+          summary: "P99 latency is exceeding 1 second"
+          description: |
+            The 99th percentile request latency is {{ $value | humanizeDuration }}.
+            Users are experiencing slow responses.
+          runbook: "https://runbooks.example.com/vision-moderation/latency-p99-high"
+
+      # Model drift detection alert
+      - alert: DriftDetected
+        expr: |
+          max(
+            max_over_time(model_input_psi{job="vision-moderation"}[1h])
+          ) by (feature) > 0.2
+        for: 1h
+        labels:
+          severity: ticket
+          slo: model_quality
+          component: vision-moderation
+        annotations:
+          summary: "Input feature drift detected"
+          description: |
+            Feature drift (PSI) exceeds threshold of 0.2 for one or more features.
+            Current max PSI: {{ $value }}.
+            Data distribution has significantly shifted from training data.
+          runbook: "https://runbooks.example.com/vision-moderation/drift-detected"
+
+      # Model version mismatch alert
+      - alert: ModelVersionMismatch
+        expr: |
+          count(
+            label_replace(
+              count by (pod_name, model_version) (
+                increase(model_version_mismatch_total{job="vision-moderation"}[5m])
+              ),
+              "status", "mismatch", "", ""
+            )
+          ) > 0
+        for: 5m
+        labels:
+          severity: page
+          slo: deployment_health
+          component: vision-moderation
+        annotations:
+          summary: "Model version mismatch detected between registry and replicas"
+          description: |
+            One or more replicas are serving a different model version than registered.
+            Registry expects a specific version, but some pods are serving different versions.
+            This indicates a failed or incomplete deployment rollout.
+          runbook: "https://runbooks.example.com/vision-moderation/model-version-mismatch"

@@ -1,0 +1,172 @@
+name: Deploy Vision Moderation Model
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-model-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: ${{ github.sha }}
+  IMAGE: ghcr.io/${{ github.repository }}:${{ github.sha }}
+
+jobs:
+  lint:
+    name: Lint OpenAPI and Dockerfile
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Lint OpenAPI spec
+        run: |
+          set -euo pipefail
+          SPEC_FILE="$(find . -maxdepth 3 -type f \( -name 'openapi.yaml' -o -name 'openapi.yml' \) | head -n 1)"
+          if [ -z "$SPEC_FILE" ]; then
+            echo "No OpenAPI spec found at openapi.yaml or openapi.yml"
+            exit 1
+          fi
+          npx --yes @redocly/cli@latest lint "$SPEC_FILE"
+
+      - name: Lint Dockerfile
+        uses: hadolint/hadolint-action@v3
+        with:
+          dockerfile: Dockerfile
+
+  test:
+    name: Unit and contract tests
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run unit tests
+        run: ./scripts/test-unit.sh
+
+      - name: Run contract tests
+        run: ./scripts/test-contract.sh
+
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image tarball
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          tags: ${{ env.IMAGE }}
+          outputs: type=docker,dest=/tmp/vision-moderation-image.tar
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vision-moderation-image
+          path: /tmp/vision-moderation-image.tar
+          retention-days: 1
+
+  scan:
+    name: Scan image
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vision-moderation-image
+          path: /tmp
+
+      - name: Scan image for HIGH and CRITICAL vulnerabilities
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          input: /tmp/vision-moderation-image.tar
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          format: table
+
+  push:
+    name: Push image to GHCR
+    runs-on: ubuntu-latest
+    needs: scan
+    steps:
+      - name: Download image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: vision-moderation-image
+          path: /tmp
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN || github.token }}
+
+      - name: Load and push image
+        run: |
+          set -euo pipefail
+          docker load --input /tmp/vision-moderation-image.tar
+          docker push "${IMAGE}"
+
+  deploy-staging:
+    name: Deploy to staging
+    runs-on: ubuntu-latest
+    needs: push
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: staging
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Deploy image to staging
+        run: ./scripts/deploy.sh staging "${IMAGE}"
+
+  smoke-staging:
+    name: Smoke test staging
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run staging smoke tests
+        run: ./scripts/smoke.sh staging
+
+  deploy-production:
+    name: Deploy to production
+    runs-on: ubuntu-latest
+    needs: smoke-staging
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Start 10 percent canary rollout
+        run: ./scripts/deploy.sh production "${IMAGE}" --canary 10
+
+      - name: Verify production canary
+        run: ./scripts/canary-verify.sh production "${IMAGE}"
+
+      - name: Complete production rollout
+        run: ./scripts/deploy.sh production "${IMAGE}" --full
